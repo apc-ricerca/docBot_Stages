@@ -1,6 +1,7 @@
 # filename: docBot_Stages/phases/assessment_logic.py
 # phases/assessment_logic.py (Struttura Modulare a Fasi)
-# AGGIORNATO: Implementata analisi intelligente multi-componente (EC, PV1, TS1, SV2, TS2)
+# CORRETTO: Aggiunto 'import re' mancante.
+# AGGIORNATO: Implementata analisi multi-componente (EC, PV1, TS1, SV2, TS2)
 #             dalla risposta utente iniziale nella fase ASSESSMENT_GET_EXAMPLE.
 #             Il bot chiederà poi solo i componenti mancanti.
 
@@ -8,6 +9,7 @@ import streamlit as st
 import time
 import traceback
 import json # Importato per parsing JSON
+import re   # <<<--- AGGIUNTO IMPORT MANCANTE
 
 # Importa funzioni e costanti necessarie
 from utils import log_message
@@ -40,6 +42,7 @@ Questa sequenza ti sembra descrivere bene l'esperienza? (Puoi dire 'sì' o indic
     return summary
 
 # --- Funzione Helper per Pulire Risposta LLM JSON ---
+# (Invariata nella logica, ma ora l'import re funzionerà)
 def _clean_llm_json_response(llm_response_text):
     """Tenta di estrarre un blocco JSON pulito dalla risposta dell'LLM."""
     try:
@@ -65,16 +68,23 @@ def _clean_llm_json_response(llm_response_text):
         log_message("WARN: Pulizia JSON non ha trovato ```json o ```. Uso testo grezzo.")
         return stripped_response
     except Exception as e:
+        # Questo blocco ora catturerà altri errori eventuali, non più 're is not defined'
         log_message(f"ERRORE in _clean_llm_json_response: {e}")
         return llm_response_text # Ritorna originale in caso di errore inaspettato
 
 # --- Funzione Helper per Trovare il Prossimo Passo Mancante ---
+# (Invariata)
 def _find_next_missing_step(schema):
     """
     Identifica la prossima fase GET necessaria basandosi sullo schema attuale.
     Restituisce la chiave del componente mancante (es. 'pv1', 'ts1') o None se completo.
     """
-    if not schema.get('ec'): return 'ec' # Anche se dovrebbe essere già gestito prima
+    # Assicuriamoci che schema sia un dizionario valido
+    if not isinstance(schema, dict):
+        log_message("ERRORE CRITICO: _find_next_missing_step ha ricevuto uno schema non valido.")
+        return 'ec' # Fallback sicuro
+
+    if not schema.get('ec'): return 'ec'
     if not schema.get('pv1'): return 'pv1'
     if not schema.get('ts1'): return 'ts1'
     # Consideriamo SV2 e TS2 opzionali o comunque successivi, ma chiediamoli se TS1 c'è
@@ -132,12 +142,13 @@ def handle(user_msg, current_state):
              log_message("Assessment Logic: Input non conferma diretta, assumo sia inizio Esempio -> ASSESSMENT_GET_EXAMPLE.")
              # L'input verrà processato nella fase successiva
 
-    # --- ASSESSMENT_GET_EXAMPLE (Logica Riscritto per Estrazione Multi-Componente) ---
+    # --- ASSESSMENT_GET_EXAMPLE (Logica con estrazione multi-componente) ---
     elif current_phase == 'ASSESSMENT_GET_EXAMPLE':
         log_message(f"Assessment Logic: Ricevuto input in ASSESSMENT_GET_EXAMPLE: '{user_msg[:100]}...'")
         log_message("Assessment Logic: Avvio analisi LLM multi-componente (EC, PV1, TS1, SV2, TS2)...")
 
         # 1. Definisci il prompt per l'estrazione multi-componente
+        # (Prompt include piccole precisazioni a SV2/TS2)
         extraction_prompt = f"""Analizza attentamente il seguente messaggio dell'utente, che descrive (potenzialmente in parte o per intero) un'esperienza legata al DOC:
         \"\"\"
         {user_msg}
@@ -146,16 +157,16 @@ def handle(user_msg, current_state):
         1.  **EC (Evento Critico):** La situazione specifica, l'evento esterno o interno che ha innescato il ciclo (es. "uscire di casa", "toccare una maniglia", "vedere una certa immagine", "pensare a X").
         2.  **PV1 (Prima Valutazione/Ossessione):** Il primo pensiero intrusivo, dubbio, immagine o paura significativa sorta in risposta all'EC (es. "e se avessi lasciato il gas acceso?", "potrei contaminarmi", "potrei fare del male a qualcuno", "sono omosessuale?").
         3.  **TS1 (Tentativo Soluzione 1/Compulsione):** La reazione comportamentale o mentale (rituale, controllo, rassicurazione, evitamento, anche differito) messa in atto *in risposta diretta* a PV1 per gestirla.
-        4.  **SV2 (Seconda Valutazione):** Il pensiero, giudizio o valutazione (anche metacognitiva) emerso *dopo* PV1 o TS1, riguardante l'ossessione, la compulsione o sé stessi (es. "questo pensiero è terribile", "non riuscirò a smettere", "sono responsabile se...", "ho fatto bene a controllare"). NON solo un'emozione.
-        5.  **TS2 (Tentativo Soluzione 2/Evitamento Ciclo):** Una strategia/intenzione messa in atto *successivamente* per evitare situazioni simili (EC), prevenire l'ossessione (PV1), o gestire diversamente la compulsione (TS1) in futuro (es. "eviterò quel posto", "cercherò di non pensarci", "la prossima volta farò X").
+        4.  **SV2 (Seconda Valutazione):** Il pensiero, giudizio o valutazione (anche metacognitiva) emerso *dopo* PV1 o TS1, riguardante l'ossessione, la compulsione o sé stessi (es. "questo pensiero è terribile", "non riuscirò a smettere", "sono responsabile se...", "ho fatto bene a controllare"). NON solo un'emozione. Considera anche le conseguenze negative anticipate o vissute.
+        5.  **TS2 (Tentativo Soluzione 2/Evitamento Ciclo):** Una strategia/intenzione messa in atto *successivamente* per evitare situazioni simili (EC), prevenire l'ossessione (PV1), o gestire diversamente la compulsione (TS1) in futuro (es. "eviterò quel posto", "cercherò di non pensarci", "la prossima volta farò X"). Include tentativi attivi di resistere alla compulsione, anche se falliti.
 
         Restituisci il risultato ESATTAMENTE nel seguente formato JSON:
         {{
           "ec": "Testo estratto dell'Evento Critico (solo la situazione trigger)",
           "pv1": "Testo estratto della Prima Valutazione (il pensiero/dubbio iniziale)",
           "ts1": "Testo estratto della Compulsione/Tentativo Soluzione 1",
-          "sv2": "Testo estratto della Seconda Valutazione (il giudizio/pensiero)",
-          "ts2": "Testo estratto del Tentativo Soluzione 2 (strategia futura)"
+          "sv2": "Testo estratto della Seconda Valutazione (il giudizio/pensiero/conseguenza)",
+          "ts2": "Testo estratto del Tentativo Soluzione 2 (strategia futura/resistenza)"
         }}
 
         Se un componente NON è chiaramente identificabile nel messaggio fornito, imposta il suo valore su **null** o su una **stringa vuota**. Sii conciso nell'estrazione. Se non riesci a identificare chiaramente nemmeno l'EC, puoi restituire null per tutti i campi o almeno per EC. Non inventare informazioni non presenti.
@@ -163,6 +174,7 @@ def handle(user_msg, current_state):
 
         # 2. Chiama l'LLM per l'estrazione
         extracted_components = {'ec': None, 'pv1': None, 'ts1': None, 'sv2': None, 'ts2': None}
+        llm_extraction_response = None # Inizializza
         try:
             # Usiamo una history vuota per questa chiamata specifica di estrazione
             llm_extraction_response = generate_response(
@@ -172,7 +184,7 @@ def handle(user_msg, current_state):
             )
             log_message(f"Assessment Logic: Risposta LLM grezza per estrazione multi-comp: {llm_extraction_response}")
 
-            # 3. Pulisci e Parsa la risposta JSON (con gestione errori robusta)
+            # 3. Pulisci e Parsa la risposta JSON (ora _clean_llm_json_response funzionerà)
             if llm_extraction_response:
                 clean_response = _clean_llm_json_response(llm_extraction_response)
                 try:
@@ -187,29 +199,34 @@ def handle(user_msg, current_state):
                         log_message(f"Assessment Logic: Estrazione JSON riuscita - Dati: {extracted_components}")
                     else:
                         log_message("Assessment Logic: WARN - Risposta LLM pulita non è un dizionario JSON valido.")
+                        # Considera il parsing fallito se non è un dizionario
+                        raise json.JSONDecodeError("Parsed data is not a dictionary", clean_response, 0)
                 except json.JSONDecodeError as json_err:
                     log_message(f"Assessment Logic: ERRORE parsing JSON da LLM: {json_err}. Risposta LLM pulita: {clean_response}")
+                    # Fallback: Se il parsing fallisce, non abbiamo estratto nulla di affidabile
+                    # Usiamo l'intero messaggio come EC e chiediamo PV1
+                    log_message("Assessment Logic: Fallback (causa errore parsing) - Uso l'intero user_msg come EC.")
+                    new_state['schema'] = INITIAL_STATE['schema'].copy() # Reset schema
+                    new_state['schema']['ec'] = user_msg
+                    next_missing = 'pv1' # Dobbiamo chiedere PV1
+                    # Esci dal blocco try/except per andare alla transizione
             else:
-                log_message("Assessment Logic: WARN - Risposta LLM per estrazione è vuota.")
+                log_message("Assessment Logic: WARN - Risposta LLM per estrazione è vuota. Fallback.")
+                # Fallback: Se risposta LLM è vuota, usa messaggio come EC
+                new_state['schema'] = INITIAL_STATE['schema'].copy() # Reset schema
+                new_state['schema']['ec'] = user_msg
+                next_missing = 'pv1'
 
         except Exception as e:
-            log_message(f"Assessment Logic: ERRORE durante chiamata LLM per estrazione multi-comp: {e}\n{traceback.format_exc()}")
-            # Fallback: se la chiamata LLM fallisce, non abbiamo estratto nulla
-
-        # 4. Logica di Fallback e Salvataggio/Transizione
-        # Se l'EC non è stato estratto o è vuoto, usiamo l'intero messaggio utente come EC
-        # e resettiamo gli altri componenti eventualmente estratti per errore.
-        if not extracted_components.get('ec'):
-            log_message("Assessment Logic: Fallback - Estrazione EC fallita o vuota. Uso l'intero user_msg come EC.")
-            # Reset for safety, ask from PV1 onwards
+            log_message(f"Assessment Logic: ERRORE durante chiamata LLM o processing: {e}\n{traceback.format_exc()}")
+            # Fallback: Se c'è un errore imprevisto, usa messaggio come EC
+            new_state['schema'] = INITIAL_STATE['schema'].copy() # Reset schema
             new_state['schema']['ec'] = user_msg
-            new_state['schema']['pv1'] = None
-            new_state['schema']['ts1'] = None
-            new_state['schema']['sv2'] = None
-            new_state['schema']['ts2'] = None
-            next_missing = 'pv1' # Dobbiamo chiedere PV1
-        else:
-            # Salva tutti i componenti estratti (che non sono None)
+            next_missing = 'pv1'
+
+        # 4. Salva Componenti Estratti (se il parsing è riuscito e non siamo in fallback)
+        # Questo blocco viene eseguito solo se non si è entrati nei fallback sopra
+        if 'next_missing' not in locals(): # Verifica se siamo in un percorso di fallback
             for key, value in extracted_components.items():
                 if value: # Salva solo se non è None (o vuoto normalizzato a None)
                     new_state['schema'][key] = value
@@ -219,70 +236,84 @@ def handle(user_msg, current_state):
 
         # 5. Transizione e Impostazione Prompt per il Prossimo Passo
         if next_missing:
+            # Se EC è mancante dopo l'estrazione (raro, ma possibile se LLM dà null per EC)
+            if next_missing == 'ec' and not new_state['schema'].get('ec'):
+                 log_message("Assessment Logic: WARN - EC non estratto ma altri componenti forse sì. Chiedo EC.")
+                 new_state['phase'] = 'ASSESSMENT_GET_EC' # Potremmo creare una fase apposita o riusare GET_EXAMPLE? Meglio una nuova.
+                 # TODO: Implementare la logica per ASSESSMENT_GET_EC se necessario,
+                 # per ora facciamo un fallback più semplice: chiediamo PV1 assumendo che l'utente
+                 # abbia dato *qualcosa* che possa vagamente essere EC.
+                 log_message("Assessment Logic: Fallback temporaneo - Assumo input come EC implicito, chiedo PV1.")
+                 if not new_state['schema'].get('ec'): # Se proprio non c'è nulla
+                      new_state['schema']['ec'] = user_msg # Mettiamo user_msg come placeholder
+                 next_missing = 'pv1' # Forza richiesta PV1
+
+            # Costruisci prompt per il componente mancante identificato
             target_phase = f"ASSESSMENT_GET_{next_missing.upper()}"
             new_state['phase'] = target_phase
             log_message(f"Assessment Logic: Prossimo componente mancante: '{next_missing}'. Transizione a {target_phase}.")
 
-            # Costruisci il prompt per chiedere il componente mancante
             ec_text = new_state['schema'].get('ec', 'la situazione iniziale')
             pv1_text = new_state['schema'].get('pv1', 'il pensiero/ossessione')
             ts1_text = new_state['schema'].get('ts1', 'la compulsione/reazione')
             sv2_text = new_state['schema'].get('sv2', 'la valutazione secondaria')
+            # Costruisci il contesto per il prompt
+            context_parts = []
+            if new_state['schema'].get('ec'): context_parts.append(f"EC='{ec_text[:80]}...'")
+            if new_state['schema'].get('pv1'): context_parts.append(f"PV1='{pv1_text[:80]}...'")
+            if new_state['schema'].get('ts1'): context_parts.append(f"TS1='{ts1_text[:80]}...'")
+            if new_state['schema'].get('sv2'): context_parts.append(f"SV2='{sv2_text[:80]}...'")
+            context_summary = f"Finora abbiamo: {', '.join(context_parts)}" if context_parts else "Ok, iniziamo."
 
-            context_summary = f"Finora abbiamo: EC='{ec_text[:80]}...'"
-            if new_state['schema'].get('pv1'): context_summary += f", PV1='{pv1_text[:80]}...'"
-            if new_state['schema'].get('ts1'): context_summary += f", TS1='{ts1_text[:80]}...'"
-            if new_state['schema'].get('sv2'): context_summary += f", SV2='{sv2_text[:80]}...'"
-
+            # Definisci i prompt specifici
             if next_missing == 'pv1':
-                llm_task_prompt = f"Grazie. L'Evento Critico (EC) sembra essere '{ec_text[:100]}...'. Ora, potresti descrivere specificamente qual è stato il primo **pensiero, immagine, dubbio o paura (l'Ossessione - PV1)** che hai avuto in *quel momento*?"
+                llm_task_prompt = f"{context_summary}. Ora, potresti descrivere specificamente qual è stato il primo **pensiero, immagine, dubbio o paura (l'Ossessione - PV1)** che hai avuto in *quel momento*?"
             elif next_missing == 'ts1':
-                llm_task_prompt = f"Capito. Dopo l'Evento Critico ('{ec_text[:80]}...') hai avuto l'Ossessione (PV1) '{pv1_text[:100]}...'. Cosa hai fatto, pensato o sentito *subito dopo* (o anche più tardi ma collegato) **per rispondere a questa ossessione e cercare di gestirla (la Compulsione - TS1)?** (es: azione fisica, pensiero specifico, rituale mentale, rassicurazione, evitamento)."
+                llm_task_prompt = f"{context_summary}. Cosa hai fatto, pensato o sentito *subito dopo* (o anche più tardi ma collegato) **per rispondere a questa ossessione ('{pv1_text[:80]}...') e cercare di gestirla (la Compulsione - TS1)?** (es: azione fisica, pensiero specifico, rituale mentale, rassicurazione, evitamento)."
             elif next_missing == 'sv2':
-                 llm_task_prompt = f"Ok ({context_summary}). Subito **dopo** l'Ossessione ('{pv1_text[:80]}...') o la Compulsione ('{ts1_text[:80]}...'), cosa hai **PENSATO** o **GIUDICATO** riguardo a quello che stava succedendo, all'ossessione stessa o alla compulsione? Cerchiamo la **valutazione cognitiva/metacognitiva (Seconda Valutazione - SV2)**, non solo l'emozione."
+                 llm_task_prompt = f"{context_summary}. Subito **dopo** l'Ossessione ('{pv1_text[:80]}...') o la Compulsione ('{ts1_text[:80]}...'), cosa hai **PENSATO** o **GIUDICATO** riguardo a quello che stava succedendo, all'ossessione stessa, alla compulsione o alle sue conseguenze (Seconda Valutazione - SV2)? (Non solo l'emozione)."
             elif next_missing == 'ts2':
-                 llm_task_prompt = f"Bene ({context_summary}). Pensando a tutta questa esperienza, hai poi messo in atto qualche **strategia futura per EVITARE situazioni simili**, per **prevenire l'ossessione**, o per **gestire diversamente la compulsione (Tentativo Soluzione 2 - TS2)?**"
-            else: # Non dovrebbe succedere se EC è gestito nel fallback
-                log_message(f"WARN: next_missing è '{next_missing}', non gestito. Fallback a conferma.")
+                 llm_task_prompt = f"{context_summary}. Pensando a tutta questa esperienza, hai poi messo in atto qualche **strategia futura per EVITARE situazioni simili**, per **prevenire l'ossessione**, o per **gestire diversamente la compulsione (Tentativo Soluzione 2 - TS2)?** Hai provato a resistere?"
+            else: # Non dovrebbe succedere se EC è gestito
+                log_message(f"WARN: next_missing è '{next_missing}', non gestito per prompt. Fallback a conferma.")
                 next_missing = None # Forza il passaggio alla conferma
 
-        # Se non manca più nulla (o il fallback sopra lo imposta a None)
+        # Se non manca più nulla (next_missing è None)
         if not next_missing:
              log_message("Assessment Logic: Tutti i componenti necessari estratti/identificati. Transizione a ASSESSMENT_CONFIRM_SCHEMA.")
              new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA'
              bot_response_text = _create_summary_text(new_state['schema']) # Usa helper per riepilogo
 
     # --- FASI GET_PV1, GET_TS1, GET_SV2, GET_TS2 (Logica adattata) ---
-    # Queste fasi ora gestiscono l'input *specifico* per quel componente,
-    # ma la logica di validazione (se presente) e transizione rimane simile.
-    # La differenza è che ora sappiamo quali componenti *precedenti* sono già stati raccolti.
+    # (Logica di queste fasi rimane simile a prima, ma usa _find_next_missing_step)
 
     elif current_phase == 'ASSESSMENT_GET_PV1':
         log_message(f"Assessment Logic: Ricevuto input esplicito per PV1: {user_msg[:50]}...")
         new_state['schema']['pv1'] = user_msg # Salva input come PV1
-        # Trova il prossimo mancante (sarà TS1 o successivo)
         next_missing = _find_next_missing_step(new_state['schema'])
         if next_missing:
              target_phase = f"ASSESSMENT_GET_{next_missing.upper()}"
              new_state['phase'] = target_phase
              log_message(f"Assessment Logic: PV1 salvato. Prossimo mancante '{next_missing}'. Transizione a {target_phase}.")
-             # Imposta prompt per chiedere 'next_missing' (codice simile a sopra per GET_EXAMPLE)
-             ec_text = new_state['schema'].get('ec', 'la situazione iniziale')
-             pv1_text = new_state['schema'].get('pv1', 'il pensiero/ossessione') # Appena salvato
+             # Imposta prompt per chiedere 'next_missing'
+             ec_text = new_state['schema'].get('ec', '...')
+             pv1_text = new_state['schema'].get('pv1', '...') # Appena salvato
              if next_missing == 'ts1':
                  llm_task_prompt = f"Ok, l'Ossessione (PV1) identificata è '{pv1_text[:100]}...'. Adesso passiamo alla **Compulsione (TS1)**. Cosa hai fatto/pensato/sentito *in risposta diretta* a quell'ossessione per cercare di gestirla?"
-             # ... aggiungere qui logica per chiedere SV2 o TS2 se TS1 fosse già presente per qualche motivo ...
-             else: # Fallback se next_missing è inaspettato
+             elif next_missing == 'sv2':
+                 llm_task_prompt = f"Ok, PV1 '{pv1_text[:100]}...'. E la **Seconda Valutazione (SV2)**? Cosa hai pensato/giudicato dopo?" # Caso raro ma possibile
+             elif next_missing == 'ts2':
+                 llm_task_prompt = f"Ok, PV1 '{pv1_text[:100]}...'. E il **Tentativo Soluzione 2 (TS2)**? Hai provato a resistere/evitare?" # Caso raro
+             else: # Fallback
                   new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA'
                   bot_response_text = _create_summary_text(new_state['schema'])
+
         else: # Tutti presenti dopo PV1? Conferma.
              new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA'
              bot_response_text = _create_summary_text(new_state['schema'])
 
     elif current_phase == 'ASSESSMENT_GET_TS1':
         log_message(f"Assessment Logic: Ricevuto input esplicito per TS1: {user_msg[:50]}...")
-        # Qui potresti reinserire la logica di validazione TS1 con LLM se desiderato
-        # Per semplicità, ora salviamo direttamente e procediamo.
         new_state['schema']['ts1'] = user_msg # Salva input come TS1
         next_missing = _find_next_missing_step(new_state['schema']) # Sarà SV2 o TS2
         if next_missing:
@@ -290,13 +321,12 @@ def handle(user_msg, current_state):
              new_state['phase'] = target_phase
              log_message(f"Assessment Logic: TS1 salvato. Prossimo mancante '{next_missing}'. Transizione a {target_phase}.")
              # Imposta prompt per chiedere SV2 o TS2
-             ec_text = new_state['schema'].get('ec', '...')
              pv1_text = new_state['schema'].get('pv1', '...')
              ts1_text = new_state['schema'].get('ts1', '...') # Appena salvato
              if next_missing == 'sv2':
                   llm_task_prompt = f"Bene, la Compulsione (TS1) è stata '{ts1_text[:100]}...'. Ora, **subito dopo** l'Ossessione ('{pv1_text[:80]}...') o la Compulsione, cosa hai **PENSATO** o **GIUDICATO** riguardo a ciò che succedeva (Seconda Valutazione - SV2)? (Non solo l'emozione)."
              elif next_missing == 'ts2': # Se SV2 fosse già presente
-                  llm_task_prompt = f"Ok. C'è stata poi qualche **strategia futura per EVITARE/MODIFICARE** il ciclo (Tentativo Soluzione 2 - TS2)?"
+                  llm_task_prompt = f"Ok, TS1 '{ts1_text[:100]}...'. C'è stata poi qualche **strategia futura per EVITARE/MODIFICARE** il ciclo (Tentativo Soluzione 2 - TS2)?"
              else: # Fallback
                   new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA'
                   bot_response_text = _create_summary_text(new_state['schema'])
@@ -306,9 +336,6 @@ def handle(user_msg, current_state):
 
     elif current_phase == 'ASSESSMENT_GET_SV2':
         log_message(f"Assessment Logic: Ricevuto input esplicito per SV2: {user_msg[:50]}...")
-        # Qui potresti reinserire la logica di validazione SV2 con LLM
-        # Se la validazione indica 'NONE', imposta a None nello schema
-        # Per semplicità, salviamo direttamente. Considera "" o "nessuna" come None.
         sv2_value = user_msg.strip()
         if sv2_value.lower() in ["", "none", "nessuna", "niente", "non lo so"]:
             new_state['schema']['sv2'] = None
@@ -321,15 +348,13 @@ def handle(user_msg, current_state):
              log_message(f"Assessment Logic: SV2 salvato/gestito. Prossimo mancante '{next_missing}'. Transizione a ASSESSMENT_GET_TS2.")
              # Imposta prompt per chiedere TS2
              sv2_text = new_state['schema'].get('sv2', 'la valutazione precedente')
-             llm_task_prompt = f"Capito ({'SV2: '+sv2_text[:80]+'...' if sv2_text else 'SV2 non significativa'}). Ora l'ultimo punto per questo esempio: il **Tentativo di Soluzione 2 (TS2)**. C'è stata qualche strategia/intenzione futura per **evitare situazioni simili**, **prevenire l'ossessione**, o **gestire diversamente la compulsione**?"
-        else: # Tutti presenti o TS2 non necessario. Conferma.
+             llm_task_prompt = f"Capito ({'SV2: '+sv2_text[:80]+'...' if sv2_text else 'SV2 non significativa'}). Ora l'ultimo punto per questo esempio: il **Tentativo di Soluzione 2 (TS2)**. C'è stata qualche strategia/intenzione futura per **evitare situazioni simili**, **prevenire l'ossessione**, o **gestire diversamente la compulsione**? Hai provato a resistere?"
+        else: # Tutti presenti o TS2 non necessario/mancante. Conferma.
             new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA'
             bot_response_text = _create_summary_text(new_state['schema'])
 
     elif current_phase == 'ASSESSMENT_GET_TS2':
         log_message(f"Assessment Logic: Ricevuto input esplicito per TS2: {user_msg[:50]}...")
-        # Qui potresti reinserire la logica di validazione TS2 con LLM
-        # Se la validazione indica 'NONE', imposta a None nello schema
         ts2_value = user_msg.strip()
         if ts2_value.lower() in ["", "none", "nessuna", "niente", "non lo so", "no"]:
              new_state['schema']['ts2'] = None
@@ -343,8 +368,7 @@ def handle(user_msg, current_state):
 
 
     # --- FASI CONFIRM_SCHEMA, AWAIT_EDIT_TARGET, EDIT_X, COMPLETE ---
-    # La logica di queste fasi rimane sostanzialmente invariata.
-    # Usano _create_summary_text che ora gestisce meglio i valori None.
+    # (Logica invariata rispetto alla versione precedente con l'import fix)
 
     elif current_phase == 'ASSESSMENT_CONFIRM_SCHEMA':
         user_msg_processed = user_msg.strip().lower()
@@ -401,11 +425,13 @@ def handle(user_msg, current_state):
         schema_dict = new_state.get('schema')
         if target_key and isinstance(schema_dict, dict) and target_key in schema_dict:
              log_message(f"Assessment Logic: Ricevuto nuovo valore per {target_key}: {user_msg[:50]}...")
-             schema_dict[target_key] = user_msg # Aggiorna valore
+             new_value = user_msg.strip()
              # Valori null/vuoti per SV2/TS2 durante modifica?
-             if target_key in ['sv2', 'ts2'] and user_msg.strip().lower() in ["", "none", "nessuna", "niente"]:
+             if target_key in ['sv2', 'ts2'] and new_value.lower() in ["", "none", "nessuna", "niente"]:
                  schema_dict[target_key] = None
                  log_message(f"Assessment Logic: Valore per {target_key} impostato a None durante modifica.")
+             else:
+                schema_dict[target_key] = new_value # Aggiorna valore
 
              new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA' # Torna sempre a conferma dopo modifica
              bot_response_text = _create_summary_text(schema_dict) # Mostra riepilogo aggiornato
@@ -425,7 +451,7 @@ def handle(user_msg, current_state):
 
 
     # --- Gestione Chiamata LLM Specifica (se llm_task_prompt è impostato) ---
-    # (Logica invariata, ma i prompt ora sono generati dinamicamente sopra)
+    # (Logica invariata)
     if llm_task_prompt:
         log_message(f"Assessment Logic: Eseguo LLM per task specifico: {llm_task_prompt}")
         # Prepara history pulita
@@ -456,14 +482,26 @@ OBIETTIVO SPECIFICO: {llm_task_prompt}"""
     elif not bot_response_text:
         # ... (codice del fallback con RAG rimane identico) ...
         log_message(f"Assessment Logic: Nessuna logica specifica o task LLM per fase '{current_phase}'. Eseguo fallback generico...")
-        # (Il codice RAG qui è omesso per brevità, ma è identico a prima)
-        # ...
-        # Esempio di come potrebbe finire il fallback RAG/Generico
-        if 'rag_results' in locals() and rag_results: # Se RAG ha trovato qualcosa
-             rag_context = "\n\n---\nCONTESTO DAL MATERIALE DI SUPPORTO:\n"
-             for i, result in enumerate(rag_results): rag_context += f"[{i+1}] {result.get('content', '')}\n\n"
-             log_message(f"Assessment Logic: Fallback RAG ({search_type}) trovato.")
-        else: rag_context = ""; log_message(f"Assessment Logic: Fallback RAG non trovato.")
+        current_step_key = PHASE_TO_CHAPTER_KEY_MAP.get(current_phase)
+        rag_context = ""; search_type = "Nessuna"; rag_results = []
+        query_for_rag = user_msg
+
+        if current_step_key and st.session_state.get('rag_enabled', False) and current_step_key in st.session_state.get('step_indexes', {}):
+            try:
+                rag_results = search_step_rag(query_for_rag, current_step_key, top_k=2)
+                if rag_results: search_type = f"Step ({current_step_key})"
+            except Exception as e: log_message(f"ERRORE search_step_rag in fallback: {e}")
+        if not rag_results and st.session_state.get('rag_enabled', False) and 'global_index' in st.session_state and st.session_state.global_index is not None:
+             try:
+                 rag_results_global = search_global_rag(query_for_rag, top_k=3)
+                 if rag_results_global: rag_results = rag_results_global; search_type = "Globale"
+             except Exception as e: log_message(f"ERRORE search_global_rag in fallback: {e}")
+
+        if rag_results:
+              rag_context = "\n\n---\nCONTESTO DAL MATERIALE DI SUPPORTO (Potrebbe essere utile, ma non citarlo direttamente):\n"
+              for i, result in enumerate(rag_results): rag_context += f"[{i+1}] {result.get('content', '')}\n\n"
+              log_message(f"Assessment Logic: Fallback RAG ({search_type}) trovato.")
+        else: log_message(f"Assessment Logic: Fallback RAG ({search_type}) non trovato.")
 
         system_prompt_generic = f"""Sei un assistente empatico per il supporto al DOC (TCC).
 FASE CONVERSAZIONE ATTUALE: {new_state['phase']}. SCHEMA UTENTE: {new_state.get('schema', {})}.{rag_context}
@@ -471,7 +509,13 @@ ISTRUZIONI: Rispondi in ITALIANO. Tono empatico, chiaro, CONCISO. L'utente ha in
 
         # Prepara history (come sopra)
         chat_history_for_llm = []
-        # ... (codice per popolare history) ...
+        history_source = st.session_state.get('messages', [])
+        if len(history_source) > 1:
+            for msg in history_source[:-1]:
+                 role = 'model' if msg.get('role') == 'assistant' else msg.get('role')
+                 content = msg.get('content', '')
+                 if role in ['user', 'model'] and content and content.strip() not in ["...", "Sto pensando..."]:
+                     chat_history_for_llm.append({'role': role, 'parts': [content]})
 
         bot_response_text = generate_response(
             prompt=f"{system_prompt_generic}", # Prompt già contiene user_msg
