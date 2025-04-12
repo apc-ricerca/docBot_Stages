@@ -3,12 +3,11 @@
 # CORRETTO: Aggiunto 'import re' mancante.
 # AGGIORNATO: Estrazione iniziale semplificata (EC, PV1, TS1).
 # AGGIORNATO: Aggiunta fase ASSESSMENT_CONFIRM_FIRST_PART.
-# AGGIORNATO: Mantenuta validazione LLM per input SV2 (prompt affinato).
+# AGGIORNATO: Mantenuta validazione LLM per input SV2 (prompt affinato v2).
 # AGGIORNATO: Logica di EDIT_X per tornare alla fase di conferma corretta.
 # NUOVO: Implementata funzione _summarize_component_clinically.
-# AGGIORNATO: Prompt di _summarize_component_clinically modificato per maggiore fedeltà.
-# AGGIORNATO: Logica di fallback in _summarize_component_clinically per usare
-#             testo originale in caso di errore/blocco/sintesi debole.
+# AGGIORNATO: Prompt di _summarize_component_clinically modificato per maggiore fedeltà (v2).
+# AGGIORNATO: Logica di fallback in _summarize_component_clinically per usare testo originale.
 
 import streamlit as st
 import time
@@ -22,20 +21,18 @@ from llm_interface import generate_response # Importiamo per usare generate_resp
 from rag_utils import search_global_rag, search_step_rag
 from config import CONFERME, NEGAZIONI_O_DUBBI, PHASE_TO_CHAPTER_KEY_MAP, INITIAL_STATE
 
-# --- Funzione Helper per Sintesi Clinica (ma più Fedele) ---
+# --- Funzione Helper per Sintesi Clinica (ma MOLTO Fedele) ---
 def _summarize_component_clinically(component_key, user_text, schema_context):
     """
     Chiama l'LLM per rielaborare il testo dell'utente in una sintesi
-    CONCISA e MOLTO FEDELE per il componente specificato.
+    ESTREMAMENTE CONCISA e FEDELE per il componente specificato.
     In caso di fallimento della sintesi, restituisce il testo originale.
     """
-    # Pulisci testo utente iniziale da virgolette
     original_text_cleaned = user_text.strip().strip('"').strip("'")
-
     if not original_text_cleaned or not component_key:
-        return original_text_cleaned # Ritorna testo pulito se input non valido
+        return original_text_cleaned
 
-    log_message(f"Assessment Logic: Avvio sintesi fedele per {component_key.upper()}...")
+    log_message(f"Assessment Logic: Avvio sintesi ESTREMAMENTE fedele per {component_key.upper()}...")
 
     definitions = {
         'ec': "l'evento specifico (interno o esterno) che ha attivato il ciclo.",
@@ -46,64 +43,67 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
     }
     role_description = definitions.get(component_key, "un elemento dello schema DOC")
 
+    # Prompt v2: ancora più restrittivo sulla fedeltà e neutralità
     summarization_prompt = f"""CONTESTO: Stiamo costruendo uno schema di funzionamento DOC.
     COMPONENTE DA SINTETIZZARE: {component_key.upper()} - che rappresenta: {role_description}
     TESTO FORNITO DALL'UTENTE per questo componente: "{original_text_cleaned}"
     SCHEMA PARZIALE ATTUALE (per contesto addizionale): {schema_context}
 
-    TASK: Rielabora il TESTO FORNITO DALL'UTENTE in una sintesi **estremamente concisa** (idealmente 1 frase breve) per il componente {component_key.upper()}, **usando ESATTAMENTE le parole chiave e la struttura dell'utente il più possibile**. La sintesi deve catturare l'essenza della dichiarazione dell'utente per quel componente, **EVITANDO QUALSIASI interpretazione psicologica, giudizio o linguaggio tecnico/clinico** se non usato esplicitamente dall'utente. NON usare parole come 'errore', 'sbaglio', 'giusto', 'sbagliato'. **NON aggiungere informazioni o parole non presenti nel testo originale**, limitati ad accorciare e/o estrarre la frase chiave mantenendo la formulazione originale.
+    TASK: Rielabora il TESTO FORNITO DALL'UTENTE in una sintesi **estremamente concisa** (idealmente 1 frase breve, massimo 10-15 parole se possibile) per il componente {component_key.upper()}.
+    **REGOLE FONDAMENTALI:**
+    1.  **MASSIMA FEDELTÀ:** Usa **ESATTAMENTE le stesse parole chiave** dell'utente. Non sostituire parole se non strettamente necessario per la grammatica minima.
+    2.  **NO INTERPRETAZIONE:** Non aggiungere **nessuna** interpretazione psicologica, giudizio o valutazione.
+    3.  **NO PAROLE ESTERNE:** Non usare **mai** parole come 'errore', 'sbaglio', 'giusto', 'sbagliato', 'negativo', 'positivo', 'consapevolezza', 'impulso', 'tentativo', 'fallimento' a meno che non siano **presenti nel testo originale dell'utente**.
+    4.  **CONCISIONE ESTREMA:** Rimuovi solo le parole superflue per rendere la frase più breve possibile mantenendo il significato letterale espresso dall'utente. Se il testo è già conciso, restituiscilo così com'è.
 
-    Output Atteso: Solo la sintesi estremamente concisa e fedele al testo utente.
+    Output Atteso: Solo la sintesi estremamente concisa e letterale.
     """
     try:
-        # Chiamiamo generate_response che ha già gestione errori/blocchi base
         summary = generate_response(
             prompt=summarization_prompt,
             history=[],
             model=st.session_state.get('model_gemini')
         )
-        summary = summary.strip() # Pulisci spazi
+        summary = summary.strip()
 
-        # Lista di sottostringhe che indicano un fallimento o blocco da generate_response
         error_indicators = [
-            "risposta vuota dal modello",
-            "bloccata per motivi di sicurezza",
-            "non ho potuto elaborare",
-            "errore tecnico imprevisto",
-            "non riesco a riassumere", # Aggiunte dal nostro prompt
-            "non è possibile",
-            "non chiaro",
+            "risposta vuota dal modello", "bloccata per motivi di sicurezza",
+            "non ho potuto elaborare", "errore tecnico imprevisto",
+            "non riesco a riassumere", "non è possibile", "non chiaro",
             "necessarie ulteriori informazioni"
         ]
 
-        # Controlla se la risposta è valida: non vuota, lunghezza minima, non un messaggio di errore/rifiuto
         is_valid_summary = True
-        if not summary or len(summary) < 5: # Aumentato lunghezza minima
+        if not summary or len(summary) < 3: # Molto corto è sospetto
              is_valid_summary = False
+             log_message(f"WARN: Sintesi per {component_key.upper()} troppo corta o vuota ('{summary}').")
         else:
-            # Controlla se contiene una delle stringhe di errore/rifiuto
             summary_lower = summary.lower()
             for indicator in error_indicators:
                 if indicator in summary_lower:
                     is_valid_summary = False
+                    log_message(f"WARN: Sintesi per {component_key.upper()} sembra un errore/blocco ('{summary}').")
                     break
+            # Controllo aggiuntivo: se la sintesi è identica al testo originale lungo, potrebbe indicare fallimento
+            if len(original_text_cleaned) > 30 and summary == original_text_cleaned:
+                 log_message(f"WARN: Sintesi per {component_key.upper()} identica a originale lungo. Possibile fallimento LLM.")
+                 # Potremmo decidere di usare comunque l'originale o tentare altro, per ora usiamo originale
+                 is_valid_summary = False
 
-        # Se la sintesi non è valida, usa il testo originale
+
         if not is_valid_summary:
-             log_message(f"WARN: Sintesi fedele per {component_key.upper()} fallita o bloccata o debole ('{summary}'). Uso testo originale.")
-             return original_text_cleaned # FALLBACK
+             log_message(f"WARN: Usando testo originale per {component_key.upper()}.")
+             return original_text_cleaned
         else:
-            # Se valida, pulisci eventuali virgolette e restituisci
             log_message(f"Sintesi fedele per {component_key.upper()}: '{summary}' (da: '{original_text_cleaned[:50]}...')")
             return summary.strip('"').strip("'")
 
     except Exception as e:
-        # Cattura qualsiasi altra eccezione durante la chiamata o il processamento
         log_message(f"ERRORE durante sintesi fedele per {component_key.upper()}: {e}. Uso testo originale.")
-        return original_text_cleaned # FALLBACK
+        return original_text_cleaned
 
-# --- Funzione Helper per creare il testo del riepilogo COMPLETO ---
-# (Invariata, usa i valori dallo schema)
+# --- Funzioni Helper Riepilogo ---
+# (Invariate, usano i valori sintetizzati/originali dallo schema)
 def _create_summary_text(schema):
     ec = schema.get('ec', 'N/D')
     pv1 = schema.get('pv1', 'N/D')
@@ -123,8 +123,6 @@ def _create_summary_text(schema):
 Questa sequenza ti sembra descrivere bene l'esperienza? (Puoi dire 'sì' o indicare cosa modificare)"""
     return summary
 
-# --- Funzione Helper per creare il testo del riepilogo PRIMA PARTE ---
-# (Invariata, usa i valori dallo schema)
 def _create_first_part_summary_text(schema):
     ec = schema.get('ec', 'N/D')
     pv1 = schema.get('pv1', 'N/D')
@@ -140,7 +138,7 @@ Ti sembra che descriva correttamente l'inizio dell'esperienza? Possiamo andare a
 (Puoi dire 'sì' o indicare cosa modificare in questa prima parte)"""
     return summary
 
-# --- Funzione Helper per Pulire Risposta LLM JSON ---
+# --- Funzione Helper Pulizia JSON ---
 # (Invariata)
 def _clean_llm_json_response(llm_response_text):
     if not llm_response_text: return ""
@@ -159,7 +157,7 @@ def _clean_llm_json_response(llm_response_text):
         log_message(f"ERRORE in _clean_llm_json_response: {e}")
         return llm_response_text
 
-# --- Funzione Helper per Trovare il Prossimo Passo Mancante ---
+# --- Funzione Helper Trova Mancante ---
 # (Invariata)
 def _find_next_missing_step(schema):
     if not isinstance(schema, dict):
@@ -172,7 +170,7 @@ def _find_next_missing_step(schema):
     if not schema.get('ts2'): return 'ts2'
     return None
 
-# --- Funzione Handler Principale per le Fasi di Assessment ---
+# --- Funzione Handler Principale ---
 def handle(user_msg, current_state):
     new_state = current_state.copy()
     if 'schema' not in new_state or not isinstance(new_state.get('schema'), dict):
@@ -189,7 +187,7 @@ def handle(user_msg, current_state):
     negazioni_o_dubbi = NEGAZIONI_O_DUBBI
     negazioni_esplicite = ["", "none", "nessuna", "niente", "non lo so", "non saprei", "no"]
 
-    # --- Logica Specifica per Sotto-Fasi dell'Assessment ---
+    # --- Logica Fasi Assessment ---
 
     if current_phase == 'START':
         new_state['phase'] = 'ASSESSMENT_INTRO'
@@ -197,7 +195,6 @@ def handle(user_msg, current_state):
         log_message("Assessment Logic: Transizione START -> ASSESSMENT_INTRO.")
 
     elif current_phase == 'ASSESSMENT_INTRO':
-        # (Logica invariata)
         user_msg_processed = user_msg.strip().lower()
         is_confirmation = user_msg_processed in conferme or \
                           any(user_msg_processed.startswith(conf + " ") for conf in conferme if isinstance(conf, str)) or \
@@ -329,7 +326,7 @@ def handle(user_msg, current_state):
         bot_response_text = _create_first_part_summary_text(new_state['schema'])
 
     elif current_phase == 'ASSESSMENT_GET_SV2':
-        # (Logica validazione e chiamata _summarize_component_clinically invariata)
+        # (Logica validazione con prompt affinato e chiamata _summarize_component_clinically invariata)
         log_message(f"Assessment Logic: Ricevuto input per SV2: {user_msg[:50]}...")
         sv2_input = user_msg.strip()
         if sv2_input.lower() in negazioni_esplicite:
@@ -340,18 +337,19 @@ def handle(user_msg, current_state):
             llm_task_prompt = f"Capito (SV2 non significativa). Ora l'ultimo punto: il **Tentativo di Soluzione 2 (TS2)**. C'è stata qualche strategia/intenzione futura per **evitare situazioni simili**, **prevenire l'ossessione**, o **gestire diversamente la compulsione**? Hai provato a resistere?"
         else:
             log_message("Assessment Logic: Avvio validazione LLM per SV2...")
+            # Prompt validazione v2: più chiaro su conseguenze
             validation_prompt = f"""ANALISI RISPOSTA UTENTE PER SECONDA VALUTAZIONE (SV2)
             CONTESTO: Dopo Evento Critico (EC)="{new_state['schema'].get('ec', 'N/D')}", Ossessione (PV1)="{new_state['schema'].get('pv1', 'N/D')}", e Compulsione (TS1)="{new_state['schema'].get('ts1', 'N/D')}".
             DOMANDA POSTA ALL'UTENTE: Chiedeva la Seconda Valutazione (SV2) - il PENSIERO o GIUDIZIO (anche su conseguenze) dopo PV1/TS1, non solo l'emozione.
             RISPOSTA UTENTE DA ANALIZZARE: "{sv2_input}"
             TASK: La risposta dell'utente descrive effettivamente una Valutazione Cognitiva Secondaria (SV2)?
-            - È un pensiero, un giudizio, una valutazione (anche metacognitiva), una riflessione sulle **conseguenze** (es. "rischierò il licenziamento", "farò tardi", "ho pensato che fosse terribile")? -> VALIDO_SV2
+            - È un pensiero, un giudizio, una valutazione (anche metacognitiva), una riflessione sulle **conseguenze** (es. "rischierò il licenziamento", "farò tardi", "ho pensato che fosse terribile", "questo pensiero è inaccettabile")? -> VALIDO_SV2
             - È SOLO un'emozione (es. "ansia", "paura")? -> NON_VALIDO_SV2
-            - È un'azione, un comportamento, un tentativo (anche fallito) di fare/non fare qualcosa (es. "sono tornato indietro", "ho cercato di resistere")? -> NON_VALIDO_SV2
+            - È un'azione, un comportamento, un tentativo (anche fallito) di fare/non fare qualcosa (es. "sono tornato indietro", "ho cercato di resistere", "ho chiesto rassicurazioni")? -> NON_VALIDO_SV2
             - È una negazione esplicita o "non lo so"? -> NEGATIVO
             - È qualcos'altro di non pertinente? -> NON_VALIDO_SV2
             Output Atteso: Rispondi ESATTAMENTE con UNA delle seguenti stringhe: VALIDO_SV2, NON_VALIDO_SV2, NEGATIVO
-            """ # Aggiunto esempio a VALIDO_SV2
+            """
             try:
                 validation_response = generate_response(prompt=validation_prompt, history=[], model=st.session_state.get('model_gemini')).strip().upper()
                 log_message(f"Assessment Logic: Risultato validazione LLM per SV2: '{validation_response}'")
