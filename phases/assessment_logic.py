@@ -6,8 +6,8 @@
 # AGGIORNATO: Mantenuta validazione LLM per input SV2.
 # AGGIORNATO: Logica di EDIT_X per tornare alla fase di conferma corretta.
 # NUOVO: Implementata funzione _summarize_component_clinically.
-# AGGIORNATO: Prompt di _summarize_component_clinically modificato per
-#             richiedere maggiore fedeltà al testo utente e meno interpretazione.
+# AGGIORNATO: Prompt di _summarize_component_clinically modificato per maggiore fedeltà.
+# AGGIORNATO: Prompt di validazione SV2 modificato per migliore riconoscimento conseguenze.
 
 import streamlit as st
 import time
@@ -25,7 +25,7 @@ from config import CONFERME, NEGAZIONI_O_DUBBI, PHASE_TO_CHAPTER_KEY_MAP, INITIA
 def _summarize_component_clinically(component_key, user_text, schema_context):
     """
     Chiama l'LLM per rielaborare il testo dell'utente in una sintesi
-    CONCISA e FEDELE per il componente specificato.
+    CONCISA e MOLTO FEDELE per il componente specificato.
     """
     if not user_text or not component_key:
         return user_text
@@ -41,15 +41,15 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
     }
     role_description = definitions.get(component_key, "un elemento dello schema DOC")
 
-    # Prompt modificato per maggiore fedeltà
+    # Prompt ulteriormente modificato per massima fedeltà e neutralità
     summarization_prompt = f"""CONTESTO: Stiamo costruendo uno schema di funzionamento DOC.
     COMPONENTE DA SINTETIZZARE: {component_key.upper()} - che rappresenta: {role_description}
     TESTO FORNITO DALL'UTENTE per questo componente: "{user_text}"
     SCHEMA PARZIALE ATTUALE (per contesto addizionale): {schema_context}
 
-    TASK: Rielabora il TESTO FORNITO DALL'UTENTE in una sintesi **molto concisa** (massimo 1 frase breve, se possibile) per il componente {component_key.upper()}, **usando il più possibile le parole chiave dell'utente**. La sintesi deve catturare l'essenza della dichiarazione dell'utente per quel componente, **evitando interpretazioni psicologiche o linguaggio troppo tecnico/clinico** se non usato dall'utente. Focalizzati sull'estrarre la frase o il concetto chiave relativo al ruolo del componente, ma **mantieni la formulazione MOLTO vicina all'originale**. NON fare una valutazione psicologica, solo una sintesi fedele ma concisa.
+    TASK: Rielabora il TESTO FORNITO DALL'UTENTE in una sintesi **estremamente concisa** (idealmente 1 frase breve) per il componente {component_key.upper()}, **usando ESATTAMENTE le parole chiave e la struttura dell'utente il più possibile**. La sintesi deve catturare l'essenza della dichiarazione dell'utente per quel componente, **EVITANDO QUALSIASI interpretazione psicologica, giudizio o linguaggio tecnico/clinico** se non usato esplicitamente dall'utente. NON usare parole come 'errore', 'sbaglio', 'giusto', 'sbagliato'. **NON aggiungere informazioni o parole non presenti nel testo originale**, limitati ad accorciare e/o estrarre la frase chiave mantenendo la formulazione originale.
 
-    Output Atteso: Solo la sintesi molto concisa e fedele al testo utente.
+    Output Atteso: Solo la sintesi estremamente concisa e fedele al testo utente.
     """
     try:
         summary = generate_response(
@@ -60,10 +60,11 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
         summary = summary.strip()
 
         # Fallback se la sintesi è vuota, troppo corta, o sembra una frase di rifiuto dell'LLM
-        if not summary or len(summary) < 5 or \
+        if not summary or len(summary) < 3 or \
            "non riesco a" in summary.lower() or \
            "non è possibile" in summary.lower() or \
-           "non chiaro" in summary.lower():
+           "non chiaro" in summary.lower() or \
+           "necessarie ulteriori informazioni" in summary.lower():
              log_message(f"WARN: Sintesi fedele per {component_key.upper()} debole o fallita ('{summary}'). Uso testo originale.")
              return user_text.strip().strip('"').strip("'")
         else:
@@ -75,7 +76,6 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
         return user_text.strip().strip('"').strip("'")
 
 # --- Funzione Helper per creare il testo del riepilogo COMPLETO ---
-# (Usa i valori sintetizzati dallo schema)
 def _create_summary_text(schema):
     ec = schema.get('ec', 'N/D')
     pv1 = schema.get('pv1', 'N/D')
@@ -96,7 +96,6 @@ Questa sequenza ti sembra descrivere bene l'esperienza? (Puoi dire 'sì' o indic
     return summary
 
 # --- Funzione Helper per creare il testo del riepilogo PRIMA PARTE ---
-# (Usa i valori sintetizzati dallo schema)
 def _create_first_part_summary_text(schema):
     ec = schema.get('ec', 'N/D')
     pv1 = schema.get('pv1', 'N/D')
@@ -113,7 +112,6 @@ Ti sembra che descriva correttamente l'inizio dell'esperienza? Possiamo andare a
     return summary
 
 # --- Funzione Helper per Pulire Risposta LLM JSON ---
-# (Invariata)
 def _clean_llm_json_response(llm_response_text):
     if not llm_response_text: return ""
     try:
@@ -132,7 +130,6 @@ def _clean_llm_json_response(llm_response_text):
         return llm_response_text
 
 # --- Funzione Helper per Trovare il Prossimo Passo Mancante ---
-# (Invariata)
 def _find_next_missing_step(schema):
     if not isinstance(schema, dict):
         log_message("ERRORE CRITICO: _find_next_missing_step ha ricevuto uno schema non valido.")
@@ -230,24 +227,21 @@ def handle(user_msg, current_state):
         if not parsing_ok:
             log_message("Assessment Logic: Fallback (causa errore estrazione/parsing sempl.) - Uso l'intero user_msg come EC.")
             new_state['schema'] = INITIAL_STATE['schema'].copy()
-            # Non sintetizziamo qui, il testo è grezzo e potenzialmente lungo/errato
-            new_state['schema']['ec'] = user_msg
+            new_state['schema']['ec'] = user_msg # Salva testo grezzo
             new_state['phase'] = 'ASSESSMENT_GET_PV1'
             log_message(f"Assessment Logic: Transizione fallback a {new_state['phase']}.")
             ec_text = new_state['schema'].get('ec', 'la situazione descritta')
             llm_task_prompt = f"Grazie per aver descritto la situazione: '{ec_text[:100]}...'. Ora vorrei capire l'**Ossessione (PV1)**. Quale è stato il primo pensiero, immagine, dubbio o paura che hai avuto in *quel momento*?"
         else:
-            # Successo: SINTETIZZA e Salva EC, PV1, TS1 estratti
+            # Successo: SINTETIZZA (fedelmente) e Salva EC, PV1, TS1 estratti
             for key, value in extracted_components.items():
                 if value:
-                    # Chiama la funzione di sintesi fedele prima di salvare!
                     synthesized_value = _summarize_component_clinically(key, value, new_state['schema'])
                     new_state['schema'][key] = synthesized_value
                 else:
                      new_state['schema'][key] = None
             log_message(f"Assessment Logic: Schema aggiornato dopo estrazione e SINTESI FEDELE: {new_state['schema']}")
 
-            # Transizione alla fase di conferma intermedia
             new_state['phase'] = 'ASSESSMENT_CONFIRM_FIRST_PART'
             log_message(f"Assessment Logic: Transizione a {new_state['phase']}.")
             bot_response_text = _create_first_part_summary_text(new_state['schema'])
@@ -278,13 +272,11 @@ def handle(user_msg, current_state):
         else:
             log_message("Assessment Logic: Risposta non chiara a conferma prima parte. Richiedo.")
             new_state['phase'] = 'ASSESSMENT_CONFIRM_FIRST_PART'
-            # Estrai solo il summary dalla funzione helper per evitare duplicati
             summary_text_only = _create_first_part_summary_text(new_state['schema']).split("* **Evento Critico (EC):**")[1]
             bot_response_text = f"Scusa, non ho afferrato bene. Riguardando questa prima parte:\n\n* **Evento Critico (EC):**{summary_text_only}"
 
     elif current_phase == 'ASSESSMENT_GET_PV1':
         log_message(f"Assessment Logic: Ricevuto input esplicito per PV1: {user_msg[:50]}...")
-        # SINTETIZZA e salva
         synthesized_pv1 = _summarize_component_clinically('pv1', user_msg, new_state['schema'])
         new_state['schema']['pv1'] = synthesized_pv1
         next_missing = _find_next_missing_step(new_state['schema'])
@@ -300,7 +292,6 @@ def handle(user_msg, current_state):
 
     elif current_phase == 'ASSESSMENT_GET_TS1':
         log_message(f"Assessment Logic: Ricevuto input esplicito per TS1: {user_msg[:50]}...")
-        # SINTETIZZA e salva
         synthesized_ts1 = _summarize_component_clinically('ts1', user_msg, new_state['schema'])
         new_state['schema']['ts1'] = synthesized_ts1
         new_state['phase'] = 'ASSESSMENT_CONFIRM_FIRST_PART'
@@ -318,11 +309,19 @@ def handle(user_msg, current_state):
             llm_task_prompt = f"Capito (SV2 non significativa). Ora l'ultimo punto: il **Tentativo di Soluzione 2 (TS2)**. C'è stata qualche strategia/intenzione futura per **evitare situazioni simili**, **prevenire l'ossessione**, o **gestire diversamente la compulsione**? Hai provato a resistere?"
         else:
             log_message("Assessment Logic: Avvio validazione LLM per SV2...")
+            # Prompt validazione aggiornato per essere più chiaro sulle conseguenze
             validation_prompt = f"""ANALISI RISPOSTA UTENTE PER SECONDA VALUTAZIONE (SV2)
             CONTESTO: Dopo Evento Critico (EC)="{new_state['schema'].get('ec', 'N/D')}", Ossessione (PV1)="{new_state['schema'].get('pv1', 'N/D')}", e Compulsione (TS1)="{new_state['schema'].get('ts1', 'N/D')}".
             DOMANDA POSTA ALL'UTENTE: Chiedeva la Seconda Valutazione (SV2) - il PENSIERO o GIUDIZIO (anche su conseguenze) dopo PV1/TS1, non solo l'emozione.
             RISPOSTA UTENTE DA ANALIZZARE: "{sv2_input}"
+
             TASK: La risposta dell'utente descrive effettivamente una Valutazione Cognitiva Secondaria (SV2)?
+            - È un pensiero, un giudizio, una valutazione (anche metacognitiva), una riflessione sulle **conseguenze** (es. "rischierò il licenziamento", "farò tardi")? -> VALIDO_SV2
+            - È SOLO un'emozione (es. "ansia", "paura")? -> NON_VALIDO_SV2
+            - È un'azione, un comportamento, un tentativo (anche fallito) di fare/non fare qualcosa (es. "sono tornato indietro", "ho cercato di resistere")? -> NON_VALIDO_SV2
+            - È una negazione esplicita o "non lo so"? -> NEGATIVO
+            - È qualcos'altro di non pertinente? -> NON_VALIDO_SV2
+
             Output Atteso: Rispondi ESATTAMENTE con UNA delle seguenti stringhe: VALIDO_SV2, NON_VALIDO_SV2, NEGATIVO
             """
             try:
@@ -331,7 +330,6 @@ def handle(user_msg, current_state):
 
                 if validation_response == 'VALIDO_SV2':
                     log_message("Assessment Logic: SV2 validato come VALIDO.")
-                    # SINTETIZZA (fedelmente) e salva
                     synthesized_sv2 = _summarize_component_clinically('sv2', sv2_input, new_state['schema'])
                     new_state['schema']['sv2'] = synthesized_sv2
                     new_state['phase'] = 'ASSESSMENT_GET_TS2'
@@ -349,7 +347,7 @@ def handle(user_msg, current_state):
                     new_state['phase'] = 'ASSESSMENT_GET_SV2'
                     pv1_text = new_state['schema'].get('pv1', '...')
                     ts1_text = new_state['schema'].get('ts1', '...')
-                    llm_task_prompt = f"Ok, grazie per la risposta ('{sv2_input[:80]}...'). Tuttavia, stiamo cercando specificamente la **Seconda Valutazione (SV2)**: un **pensiero**, un **giudizio** o una **valutazione** (anche sulle conseguenze) che hai avuto *dopo* l'ossessione ('{pv1_text[:80]}...') o la compulsione ('{ts1_text[:80]}...'). Non l'emozione o l'azione stessa. C'è stato un pensiero o giudizio specifico in quel momento? (Se non c'è stato o non ricordi, dimmi pure 'nessuno' o 'non ricordo')."
+                    llm_task_prompt = f"Ok, grazie per la risposta ('{sv2_input[:80]}...'). Tuttavia, stiamo cercando specificamente la **Seconda Valutazione (SV2)**: un **pensiero**, un **giudizio** o una **valutazione** (anche sulle conseguenze, come 'rischierò il licenziamento') che hai avuto *dopo* l'ossessione ('{pv1_text[:80]}...') o la compulsione ('{ts1_text[:80]}...'). Non l'emozione o l'azione stessa. C'è stato un pensiero o giudizio specifico in quel momento? (Se non c'è stato o non ricordi, dimmi pure 'nessuno' o 'non ricordo')." # Aggiunto esempio nel reprompt
             except Exception as e:
                 log_message(f"ERRORE durante validazione LLM per SV2: {e}. Richiedo.")
                 new_state['phase'] = 'ASSESSMENT_GET_SV2'
@@ -362,7 +360,6 @@ def handle(user_msg, current_state):
              new_state['schema']['ts2'] = None
              log_message("Assessment Logic: TS2 interpretato come non significativo.")
         else:
-             # SINTETIZZA (fedelmente) e salva
              synthesized_ts2 = _summarize_component_clinically('ts2', ts2_value, new_state['schema'])
              new_state['schema']['ts2'] = synthesized_ts2
              log_message("Assessment Logic: TS2 sintetizzato e salvato.")
@@ -413,8 +410,6 @@ def handle(user_msg, current_state):
              new_state['phase'] = f'ASSESSMENT_EDIT_{target_key.upper()}'
              target_names = {'ec': 'Evento Critico', 'pv1': 'Ossessione', 'ts1': 'Compulsione', 'sv2': 'Seconda Valutazione', 'ts2': 'Tentativo Soluzione 2'}
              target_name = target_names.get(target_key, target_key)
-             # Mostra il valore NON sintetizzato se disponibile (più facile per l'utente)
-             # Potremmo salvare sia raw che sintesi, ma complica. Per ora mostriamo sintesi.
              current_value = new_state.get('schema', {}).get(target_key, "Non definito")
              llm_task_prompt = f"Ok, vuoi modificare '{target_name}'. Il valore attuale (sintetizzato) è: \"{current_value}\". Per favore, fornisci la nuova descrizione completa per questo punto (verrà risintetizzata)."
              log_message(f"Assessment Logic: Target modifica '{target_key}'. Transizione a {new_state['phase']}.")
@@ -432,12 +427,10 @@ def handle(user_msg, current_state):
         if target_key and isinstance(schema_dict, dict) and target_key in schema_dict:
              log_message(f"Assessment Logic: Ricevuto nuovo valore per {target_key}: {user_msg[:50]}...")
              new_value = user_msg.strip()
-             # Applica sintesi fedele prima di salvare il valore modificato
              if target_key in ['sv2', 'ts2'] and new_value.lower() in negazioni_esplicite:
                  synthesized_value = None
                  log_message(f"Assessment Logic: Valore per {target_key} impostato a None durante modifica.")
              else:
-                 # Sintetizza il nuovo valore fornito dall'utente
                  synthesized_value = _summarize_component_clinically(target_key, new_value, schema_dict)
 
              schema_dict[target_key] = synthesized_value
@@ -487,7 +480,7 @@ OBIETTIVO SPECIFICO: {llm_task_prompt}"""
     # --- Fallback Generico ---
     elif not bot_response_text:
         log_message(f"Assessment Logic: Nessuna logica specifica o task LLM per fase '{current_phase}'. Eseguo fallback generico...")
-        rag_context = "" # Simula assenza RAG per brevità
+        rag_context = ""
         system_prompt_generic = f"""Sei un assistente empatico per il supporto al DOC (TCC). FASE CONVERSAZIONE ATTUALE: {new_state['phase']}. SCHEMA UTENTE: {new_state.get('schema', {})}.{rag_context} ISTRUZIONI: Rispondi in ITALIANO. Tono empatico, chiaro, CONCISO. L'utente ha inviato un messaggio ('{user_msg[:100]}...') che non rientra nel flusso previsto. Rispondi in modo utile e pertinente. Guida gentilmente verso l'obiettivo della fase attuale ({current_phase}). Fai UNA domanda alla volta se necessario."""
         chat_history_for_llm = []
         bot_response_text = generate_response(prompt=f"{system_prompt_generic}", history=chat_history_for_llm, model=st.session_state.get('model_gemini'))
