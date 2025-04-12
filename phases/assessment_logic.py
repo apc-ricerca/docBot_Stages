@@ -3,11 +3,12 @@
 # CORRETTO: Aggiunto 'import re' mancante.
 # AGGIORNATO: Estrazione iniziale semplificata (EC, PV1, TS1).
 # AGGIORNATO: Aggiunta fase ASSESSMENT_CONFIRM_FIRST_PART.
-# AGGIORNATO: Mantenuta validazione LLM per input SV2.
+# AGGIORNATO: Mantenuta validazione LLM per input SV2 (prompt affinato).
 # AGGIORNATO: Logica di EDIT_X per tornare alla fase di conferma corretta.
 # NUOVO: Implementata funzione _summarize_component_clinically.
 # AGGIORNATO: Prompt di _summarize_component_clinically modificato per maggiore fedeltà.
-# AGGIORNATO: Prompt di validazione SV2 modificato per migliore riconoscimento conseguenze.
+# AGGIORNATO: Logica di fallback in _summarize_component_clinically per usare
+#             testo originale in caso di errore/blocco/sintesi debole.
 
 import streamlit as st
 import time
@@ -17,7 +18,7 @@ import re   # Import per espressioni regolari
 
 # Importa funzioni e costanti necessarie
 from utils import log_message
-from llm_interface import generate_response
+from llm_interface import generate_response # Importiamo per usare generate_response
 from rag_utils import search_global_rag, search_step_rag
 from config import CONFERME, NEGAZIONI_O_DUBBI, PHASE_TO_CHAPTER_KEY_MAP, INITIAL_STATE
 
@@ -26,9 +27,13 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
     """
     Chiama l'LLM per rielaborare il testo dell'utente in una sintesi
     CONCISA e MOLTO FEDELE per il componente specificato.
+    In caso di fallimento della sintesi, restituisce il testo originale.
     """
-    if not user_text or not component_key:
-        return user_text
+    # Pulisci testo utente iniziale da virgolette
+    original_text_cleaned = user_text.strip().strip('"').strip("'")
+
+    if not original_text_cleaned or not component_key:
+        return original_text_cleaned # Ritorna testo pulito se input non valido
 
     log_message(f"Assessment Logic: Avvio sintesi fedele per {component_key.upper()}...")
 
@@ -41,10 +46,9 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
     }
     role_description = definitions.get(component_key, "un elemento dello schema DOC")
 
-    # Prompt ulteriormente modificato per massima fedeltà e neutralità
     summarization_prompt = f"""CONTESTO: Stiamo costruendo uno schema di funzionamento DOC.
     COMPONENTE DA SINTETIZZARE: {component_key.upper()} - che rappresenta: {role_description}
-    TESTO FORNITO DALL'UTENTE per questo componente: "{user_text}"
+    TESTO FORNITO DALL'UTENTE per questo componente: "{original_text_cleaned}"
     SCHEMA PARZIALE ATTUALE (per contesto addizionale): {schema_context}
 
     TASK: Rielabora il TESTO FORNITO DALL'UTENTE in una sintesi **estremamente concisa** (idealmente 1 frase breve) per il componente {component_key.upper()}, **usando ESATTAMENTE le parole chiave e la struttura dell'utente il più possibile**. La sintesi deve catturare l'essenza della dichiarazione dell'utente per quel componente, **EVITANDO QUALSIASI interpretazione psicologica, giudizio o linguaggio tecnico/clinico** se non usato esplicitamente dall'utente. NON usare parole come 'errore', 'sbaglio', 'giusto', 'sbagliato'. **NON aggiungere informazioni o parole non presenti nel testo originale**, limitati ad accorciare e/o estrarre la frase chiave mantenendo la formulazione originale.
@@ -52,30 +56,54 @@ def _summarize_component_clinically(component_key, user_text, schema_context):
     Output Atteso: Solo la sintesi estremamente concisa e fedele al testo utente.
     """
     try:
+        # Chiamiamo generate_response che ha già gestione errori/blocchi base
         summary = generate_response(
             prompt=summarization_prompt,
             history=[],
             model=st.session_state.get('model_gemini')
         )
-        summary = summary.strip()
+        summary = summary.strip() # Pulisci spazi
 
-        # Fallback se la sintesi è vuota, troppo corta, o sembra una frase di rifiuto dell'LLM
-        if not summary or len(summary) < 3 or \
-           "non riesco a" in summary.lower() or \
-           "non è possibile" in summary.lower() or \
-           "non chiaro" in summary.lower() or \
-           "necessarie ulteriori informazioni" in summary.lower():
-             log_message(f"WARN: Sintesi fedele per {component_key.upper()} debole o fallita ('{summary}'). Uso testo originale.")
-             return user_text.strip().strip('"').strip("'")
+        # Lista di sottostringhe che indicano un fallimento o blocco da generate_response
+        error_indicators = [
+            "risposta vuota dal modello",
+            "bloccata per motivi di sicurezza",
+            "non ho potuto elaborare",
+            "errore tecnico imprevisto",
+            "non riesco a riassumere", # Aggiunte dal nostro prompt
+            "non è possibile",
+            "non chiaro",
+            "necessarie ulteriori informazioni"
+        ]
+
+        # Controlla se la risposta è valida: non vuota, lunghezza minima, non un messaggio di errore/rifiuto
+        is_valid_summary = True
+        if not summary or len(summary) < 5: # Aumentato lunghezza minima
+             is_valid_summary = False
         else:
-            log_message(f"Sintesi fedele per {component_key.upper()}: '{summary}' (da: '{user_text[:50]}...')")
+            # Controlla se contiene una delle stringhe di errore/rifiuto
+            summary_lower = summary.lower()
+            for indicator in error_indicators:
+                if indicator in summary_lower:
+                    is_valid_summary = False
+                    break
+
+        # Se la sintesi non è valida, usa il testo originale
+        if not is_valid_summary:
+             log_message(f"WARN: Sintesi fedele per {component_key.upper()} fallita o bloccata o debole ('{summary}'). Uso testo originale.")
+             return original_text_cleaned # FALLBACK
+        else:
+            # Se valida, pulisci eventuali virgolette e restituisci
+            log_message(f"Sintesi fedele per {component_key.upper()}: '{summary}' (da: '{original_text_cleaned[:50]}...')")
             return summary.strip('"').strip("'")
 
     except Exception as e:
+        # Cattura qualsiasi altra eccezione durante la chiamata o il processamento
         log_message(f"ERRORE durante sintesi fedele per {component_key.upper()}: {e}. Uso testo originale.")
-        return user_text.strip().strip('"').strip("'")
+        return original_text_cleaned # FALLBACK
 
 # --- Funzione Helper per creare il testo del riepilogo COMPLETO ---
+# (Invariata, usa i valori dallo schema)
 def _create_summary_text(schema):
     ec = schema.get('ec', 'N/D')
     pv1 = schema.get('pv1', 'N/D')
@@ -96,6 +124,7 @@ Questa sequenza ti sembra descrivere bene l'esperienza? (Puoi dire 'sì' o indic
     return summary
 
 # --- Funzione Helper per creare il testo del riepilogo PRIMA PARTE ---
+# (Invariata, usa i valori dallo schema)
 def _create_first_part_summary_text(schema):
     ec = schema.get('ec', 'N/D')
     pv1 = schema.get('pv1', 'N/D')
@@ -112,6 +141,7 @@ Ti sembra che descriva correttamente l'inizio dell'esperienza? Possiamo andare a
     return summary
 
 # --- Funzione Helper per Pulire Risposta LLM JSON ---
+# (Invariata)
 def _clean_llm_json_response(llm_response_text):
     if not llm_response_text: return ""
     try:
@@ -130,6 +160,7 @@ def _clean_llm_json_response(llm_response_text):
         return llm_response_text
 
 # --- Funzione Helper per Trovare il Prossimo Passo Mancante ---
+# (Invariata)
 def _find_next_missing_step(schema):
     if not isinstance(schema, dict):
         log_message("ERRORE CRITICO: _find_next_missing_step ha ricevuto uno schema non valido.")
@@ -166,11 +197,11 @@ def handle(user_msg, current_state):
         log_message("Assessment Logic: Transizione START -> ASSESSMENT_INTRO.")
 
     elif current_phase == 'ASSESSMENT_INTRO':
+        # (Logica invariata)
         user_msg_processed = user_msg.strip().lower()
         is_confirmation = user_msg_processed in conferme or \
                           any(user_msg_processed.startswith(conf + " ") for conf in conferme if isinstance(conf, str)) or \
                           any(word in conferme for word in user_msg_processed.split())
-
         if is_confirmation:
              new_state['phase'] = 'ASSESSMENT_GET_EXAMPLE'
              llm_task_prompt = "Perfetto. Allora, prova a raccontarmi una situazione concreta e recente in cui hai provato ansia, disagio o hai avuto pensieri che ti preoccupavano legati al DOC. Descrivi semplicemente cosa è successo e cosa hai pensato o fatto."
@@ -180,9 +211,9 @@ def handle(user_msg, current_state):
              log_message("Assessment Logic: Input non conferma diretta, assumo sia inizio Esempio -> ASSESSMENT_GET_EXAMPLE.")
 
     elif current_phase == 'ASSESSMENT_GET_EXAMPLE':
+        # (Logica estrazione e chiamata _summarize_component_clinically invariata)
         log_message(f"Assessment Logic: Ricevuto input in ASSESSMENT_GET_EXAMPLE: '{user_msg[:100]}...'")
         log_message("Assessment Logic: Avvio analisi LLM semplificata (EC, PV1, TS1)...")
-
         extraction_prompt = f"""Analizza attentamente il seguente messaggio dell'utente, che descrive un'esperienza legata al DOC:
         \"\"\"
         {user_msg}
@@ -201,14 +232,12 @@ def handle(user_msg, current_state):
 
         Se un componente NON è chiaramente identificabile nel messaggio fornito, imposta il suo valore su **null** o su una **stringa vuota**. Sii conciso. Se non identifichi nemmeno l'EC, restituisci null per EC. Non cercare SV2 o TS2 in questo passaggio.
         """
-
         extracted_components = {'ec': None, 'pv1': None, 'ts1': None}
         llm_extraction_response = None
         parsing_ok = False
         try:
             llm_extraction_response = generate_response(prompt=extraction_prompt, history=[], model=st.session_state.get('model_gemini'))
             log_message(f"Assessment Logic: Risposta LLM grezza per estrazione semplificata: {llm_extraction_response}")
-
             if llm_extraction_response:
                 clean_response = _clean_llm_json_response(llm_extraction_response)
                 try:
@@ -241,12 +270,12 @@ def handle(user_msg, current_state):
                 else:
                      new_state['schema'][key] = None
             log_message(f"Assessment Logic: Schema aggiornato dopo estrazione e SINTESI FEDELE: {new_state['schema']}")
-
             new_state['phase'] = 'ASSESSMENT_CONFIRM_FIRST_PART'
             log_message(f"Assessment Logic: Transizione a {new_state['phase']}.")
             bot_response_text = _create_first_part_summary_text(new_state['schema'])
 
     elif current_phase == 'ASSESSMENT_CONFIRM_FIRST_PART':
+        # (Logica invariata)
         log_message(f"Assessment Logic: Gestione fase '{current_phase}'")
         user_msg_processed = user_msg.strip().lower()
         is_modification_request = any(keyword in user_msg_processed for keyword in ["modifi", "cambia", "aggiust", "corregg", "rivedere", "precisare", "sbagliato", "errato", "non è", "diverso"]) or \
@@ -255,7 +284,6 @@ def handle(user_msg, current_state):
                           any(user_msg_processed.startswith(conf + " ") for conf in conferme if isinstance(conf, str)) or \
                           any(word in conferme for word in user_msg_processed.split())) \
                           and not is_modification_request
-
         if is_confirmation:
             log_message("Assessment Logic: Prima parte (EC/PV1/TS1) confermata.")
             new_state['phase'] = 'ASSESSMENT_GET_SV2'
@@ -276,6 +304,7 @@ def handle(user_msg, current_state):
             bot_response_text = f"Scusa, non ho afferrato bene. Riguardando questa prima parte:\n\n* **Evento Critico (EC):**{summary_text_only}"
 
     elif current_phase == 'ASSESSMENT_GET_PV1':
+        # (Logica invariata, usa _summarize_component_clinically)
         log_message(f"Assessment Logic: Ricevuto input esplicito per PV1: {user_msg[:50]}...")
         synthesized_pv1 = _summarize_component_clinically('pv1', user_msg, new_state['schema'])
         new_state['schema']['pv1'] = synthesized_pv1
@@ -291,6 +320,7 @@ def handle(user_msg, current_state):
             bot_response_text = _create_first_part_summary_text(new_state['schema'])
 
     elif current_phase == 'ASSESSMENT_GET_TS1':
+        # (Logica invariata, usa _summarize_component_clinically)
         log_message(f"Assessment Logic: Ricevuto input esplicito per TS1: {user_msg[:50]}...")
         synthesized_ts1 = _summarize_component_clinically('ts1', user_msg, new_state['schema'])
         new_state['schema']['ts1'] = synthesized_ts1
@@ -299,6 +329,7 @@ def handle(user_msg, current_state):
         bot_response_text = _create_first_part_summary_text(new_state['schema'])
 
     elif current_phase == 'ASSESSMENT_GET_SV2':
+        # (Logica validazione e chiamata _summarize_component_clinically invariata)
         log_message(f"Assessment Logic: Ricevuto input per SV2: {user_msg[:50]}...")
         sv2_input = user_msg.strip()
         if sv2_input.lower() in negazioni_esplicite:
@@ -309,21 +340,18 @@ def handle(user_msg, current_state):
             llm_task_prompt = f"Capito (SV2 non significativa). Ora l'ultimo punto: il **Tentativo di Soluzione 2 (TS2)**. C'è stata qualche strategia/intenzione futura per **evitare situazioni simili**, **prevenire l'ossessione**, o **gestire diversamente la compulsione**? Hai provato a resistere?"
         else:
             log_message("Assessment Logic: Avvio validazione LLM per SV2...")
-            # Prompt validazione aggiornato per essere più chiaro sulle conseguenze
             validation_prompt = f"""ANALISI RISPOSTA UTENTE PER SECONDA VALUTAZIONE (SV2)
             CONTESTO: Dopo Evento Critico (EC)="{new_state['schema'].get('ec', 'N/D')}", Ossessione (PV1)="{new_state['schema'].get('pv1', 'N/D')}", e Compulsione (TS1)="{new_state['schema'].get('ts1', 'N/D')}".
             DOMANDA POSTA ALL'UTENTE: Chiedeva la Seconda Valutazione (SV2) - il PENSIERO o GIUDIZIO (anche su conseguenze) dopo PV1/TS1, non solo l'emozione.
             RISPOSTA UTENTE DA ANALIZZARE: "{sv2_input}"
-
             TASK: La risposta dell'utente descrive effettivamente una Valutazione Cognitiva Secondaria (SV2)?
-            - È un pensiero, un giudizio, una valutazione (anche metacognitiva), una riflessione sulle **conseguenze** (es. "rischierò il licenziamento", "farò tardi")? -> VALIDO_SV2
+            - È un pensiero, un giudizio, una valutazione (anche metacognitiva), una riflessione sulle **conseguenze** (es. "rischierò il licenziamento", "farò tardi", "ho pensato che fosse terribile")? -> VALIDO_SV2
             - È SOLO un'emozione (es. "ansia", "paura")? -> NON_VALIDO_SV2
             - È un'azione, un comportamento, un tentativo (anche fallito) di fare/non fare qualcosa (es. "sono tornato indietro", "ho cercato di resistere")? -> NON_VALIDO_SV2
             - È una negazione esplicita o "non lo so"? -> NEGATIVO
             - È qualcos'altro di non pertinente? -> NON_VALIDO_SV2
-
             Output Atteso: Rispondi ESATTAMENTE con UNA delle seguenti stringhe: VALIDO_SV2, NON_VALIDO_SV2, NEGATIVO
-            """
+            """ # Aggiunto esempio a VALIDO_SV2
             try:
                 validation_response = generate_response(prompt=validation_prompt, history=[], model=st.session_state.get('model_gemini')).strip().upper()
                 log_message(f"Assessment Logic: Risultato validazione LLM per SV2: '{validation_response}'")
@@ -347,13 +375,14 @@ def handle(user_msg, current_state):
                     new_state['phase'] = 'ASSESSMENT_GET_SV2'
                     pv1_text = new_state['schema'].get('pv1', '...')
                     ts1_text = new_state['schema'].get('ts1', '...')
-                    llm_task_prompt = f"Ok, grazie per la risposta ('{sv2_input[:80]}...'). Tuttavia, stiamo cercando specificamente la **Seconda Valutazione (SV2)**: un **pensiero**, un **giudizio** o una **valutazione** (anche sulle conseguenze, come 'rischierò il licenziamento') che hai avuto *dopo* l'ossessione ('{pv1_text[:80]}...') o la compulsione ('{ts1_text[:80]}...'). Non l'emozione o l'azione stessa. C'è stato un pensiero o giudizio specifico in quel momento? (Se non c'è stato o non ricordi, dimmi pure 'nessuno' o 'non ricordo')." # Aggiunto esempio nel reprompt
+                    llm_task_prompt = f"Ok, grazie per la risposta ('{sv2_input[:80]}...'). Tuttavia, stiamo cercando specificamente la **Seconda Valutazione (SV2)**: un **pensiero**, un **giudizio** o una **valutazione** (anche sulle conseguenze, come 'rischierò il licenziamento') che hai avuto *dopo* l'ossessione ('{pv1_text[:80]}...') o la compulsione ('{ts1_text[:80]}...'). Non l'emozione o l'azione stessa. C'è stato un pensiero o giudizio specifico in quel momento? (Se non c'è stato o non ricordi, dimmi pure 'nessuno' o 'non ricordo')."
             except Exception as e:
                 log_message(f"ERRORE durante validazione LLM per SV2: {e}. Richiedo.")
                 new_state['phase'] = 'ASSESSMENT_GET_SV2'
                 llm_task_prompt = f"Scusa, ho avuto un problema nell'analizzare la tua risposta per la Seconda Valutazione. Potresti ripeterla o riformularla? Ricorda, cerchiamo un pensiero o un giudizio avuto dopo l'ossessione o la compulsione."
 
     elif current_phase == 'ASSESSMENT_GET_TS2':
+        # (Logica invariata, usa _summarize_component_clinically)
         log_message(f"Assessment Logic: Ricevuto input esplicito per TS2: {user_msg[:50]}...")
         ts2_value = user_msg.strip()
         if ts2_value.lower() in negazioni_esplicite:
@@ -368,6 +397,7 @@ def handle(user_msg, current_state):
         log_message("Assessment Logic: Transizione a ASSESSMENT_CONFIRM_SCHEMA.")
 
     elif current_phase == 'ASSESSMENT_CONFIRM_SCHEMA':
+        # (Logica invariata)
         log_message(f"Assessment Logic: Gestione fase '{current_phase}'")
         user_msg_processed = user_msg.strip().lower()
         is_modification_request = any(keyword in user_msg_processed for keyword in ["modifi", "cambia", "aggiust", "corregg", "rivedere", "precisare", "sbagliato", "errato", "non è", "diverso"]) or \
@@ -376,7 +406,6 @@ def handle(user_msg, current_state):
                           any(user_msg_processed.startswith(conf + " ") for conf in conferme if isinstance(conf, str)) or \
                           any(word in conferme for word in user_msg_processed.split())) \
                           and not is_modification_request
-
         if is_confirmation:
             new_state['phase'] = 'RESTRUCTURING_INTRO'
             bot_response_text = "Ottimo, grazie per la conferma! Avere chiaro questo schema completo è un passo importante.\n\nOra che abbiamo definito un esempio del ciclo, possiamo iniziare ad approfondire le valutazioni e i pensieri che lo mantengono. Ti andrebbe di passare alla fase successiva, chiamata **Ristrutturazione Cognitiva**?"
@@ -393,6 +422,7 @@ def handle(user_msg, current_state):
             new_state['phase'] = 'ASSESSMENT_CONFIRM_SCHEMA'
 
     elif current_phase == 'ASSESSMENT_AWAIT_EDIT_TARGET':
+        # (Logica invariata)
          log_message(f"Assessment Logic: Gestione fase '{current_phase}'")
          user_input_lower = user_msg.lower()
          target_key = None
@@ -401,10 +431,8 @@ def handle(user_msg, current_state):
          elif 'compulsione' in user_input_lower or 'ts1' in user_input_lower: target_key = 'ts1'
          elif 'ossessione' in user_input_lower or 'pv1' in user_input_lower or 'prima valutazione' in user_input_lower : target_key = 'pv1'
          elif 'evento' in user_input_lower or 'critico' in user_input_lower or 'ec' in user_input_lower or 'situazione' in user_input_lower: target_key = 'ec'
-
          origin_phase = current_state.get('originating_confirmation_phase', 'ASSESSMENT_CONFIRM_SCHEMA')
          allowed_targets = ['ec', 'pv1', 'ts1'] if origin_phase == 'ASSESSMENT_CONFIRM_FIRST_PART' else ['ec', 'pv1', 'ts1', 'sv2', 'ts2']
-
          if target_key and target_key in allowed_targets:
              new_state['editing_target'] = target_key
              new_state['phase'] = f'ASSESSMENT_EDIT_{target_key.upper()}'
@@ -420,10 +448,10 @@ def handle(user_msg, current_state):
              log_message(f"Assessment Logic: Target modifica '{target_key}' non identificato o non permesso da {origin_phase}. Richiedo.")
 
     elif current_phase.startswith('ASSESSMENT_EDIT_'):
+        # (Logica invariata, usa _summarize_component_clinically)
         target_key = current_state.get('editing_target')
         schema_dict = new_state.get('schema')
         origin_phase = current_state.get('originating_confirmation_phase', 'ASSESSMENT_CONFIRM_SCHEMA')
-
         if target_key and isinstance(schema_dict, dict) and target_key in schema_dict:
              log_message(f"Assessment Logic: Ricevuto nuovo valore per {target_key}: {user_msg[:50]}...")
              new_value = user_msg.strip()
@@ -432,9 +460,7 @@ def handle(user_msg, current_state):
                  log_message(f"Assessment Logic: Valore per {target_key} impostato a None durante modifica.")
              else:
                  synthesized_value = _summarize_component_clinically(target_key, new_value, schema_dict)
-
              schema_dict[target_key] = synthesized_value
-
              new_state['phase'] = origin_phase
              if origin_phase == 'ASSESSMENT_CONFIRM_FIRST_PART':
                  bot_response_text = _create_first_part_summary_text(schema_dict)
@@ -451,17 +477,18 @@ def handle(user_msg, current_state):
                  bot_response_text = "Scusa, problema tecnico nella modifica. Rivediamo la prima parte:\n\n" + _create_first_part_summary_text(new_state.get('schema', {})).split("Ok, grazie. ")[1]
              else:
                  bot_response_text = "Scusa, problema tecnico nella modifica. Rivediamo lo schema completo:\n\n" + _create_summary_text(new_state.get('schema', {}))
-
         if 'editing_target' in new_state: del new_state['editing_target']
         if 'originating_confirmation_phase' in new_state: del new_state['originating_confirmation_phase']
 
     elif current_phase == 'ASSESSMENT_COMPLETE': # Obsoleto
+        # (Logica invariata)
         log_message("Assessment Logic: WARN - Raggiunta fase ASSESSMENT_COMPLETE (obsoleta). Reindirizzo a RESTRUCTURING_INTRO.")
         new_state['phase'] = 'RESTRUCTURING_INTRO'
         bot_response_text = "Abbiamo completato la valutazione dell'esempio. Ti andrebbe ora di passare alla fase successiva, la **Ristrutturazione Cognitiva**?"
 
     # --- Gestione Chiamata LLM Specifica ---
     if llm_task_prompt:
+        # (Logica invariata)
         log_message(f"Assessment Logic: Eseguo LLM per task specifico: {llm_task_prompt}")
         chat_history_for_llm = []
         history_source = st.session_state.get('messages', [])
@@ -479,6 +506,7 @@ OBIETTIVO SPECIFICO: {llm_task_prompt}"""
 
     # --- Fallback Generico ---
     elif not bot_response_text:
+        # (Logica invariata)
         log_message(f"Assessment Logic: Nessuna logica specifica o task LLM per fase '{current_phase}'. Eseguo fallback generico...")
         rag_context = ""
         system_prompt_generic = f"""Sei un assistente empatico per il supporto al DOC (TCC). FASE CONVERSAZIONE ATTUALE: {new_state['phase']}. SCHEMA UTENTE: {new_state.get('schema', {})}.{rag_context} ISTRUZIONI: Rispondi in ITALIANO. Tono empatico, chiaro, CONCISO. L'utente ha inviato un messaggio ('{user_msg[:100]}...') che non rientra nel flusso previsto. Rispondi in modo utile e pertinente. Guida gentilmente verso l'obiettivo della fase attuale ({current_phase}). Fai UNA domanda alla volta se necessario."""
